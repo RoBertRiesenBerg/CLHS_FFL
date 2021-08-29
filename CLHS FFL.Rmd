@@ -41,23 +41,36 @@ TransactionData <- read_csv("Transactions.csv")
 OwnerTeamData <- read_csv("Owner and Teams.csv")
 LongWeeklyScores <- read_csv("Scoreboard.csv")
 
+## Override Games
+## There will hopefully only ever be one of these
+## Jared & Luke tied in the playoffs but the tiebreaker was not the usual regular season one
+## Because of that, the tiebreak field is not working & both teams are getting a win as a result
+OverrideGames <- tibble(
+  seasonId = c(2017)
+  ,matchupPeriodId = c(15)
+  ,ScheduleId = c(99)
+  ,TeamId = c(3)
+  ,WinOverride = c(0)
+)
+
 ## Getting data into the correct format for all the charts
 PlayoffWeekStart <- SettingsData %>%
   mutate(PlayoffStartWeek = settings.scheduleSettings.matchupPeriodCount + 1) %>% 
   select(seasonId ,PlayoffStartWeek)
   
-LongScoringData <- LongWeeklyScores %>%
+LongScoringDataTemp <- LongWeeklyScores %>%
   select(seasonId:firstName ,PickNumber ,TeamName) %>%
   mutate(firstName  = str_trim(firstName)) %>%
   left_join(PlayoffWeekStart ,by = "seasonId") %>%
+  left_join(OverrideGames ,by = c("seasonId" ,"matchupPeriodId" ,"ScheduleId" ,"TeamId")) %>% 
   group_by(seasonId ,ScheduleId) %>%
   mutate(WinningPoints    = max(TotalPoints ,na.rm = TRUE)
          ,LosingPoints    = min(TotalPoints ,na.rm = TRUE)
          ,WinningTiebreak = max(Tiebreak ,na.rm = TRUE)
          ,LosingTiebreak  = min(Tiebreak ,na.rm = TRUE)
          ,Win             = if_else(WinningPoints == LosingPoints 
-                                    ,if_else(Tiebreak == WinningTiebreak ,1 ,0) 
-                                    ,if_else(TotalPoints == WinningPoints ,1 ,0)
+                                    ,if_else(Tiebreak == WinningTiebreak ,coalesce(WinOverride ,1) ,0) 
+                                    ,if_else(TotalPoints == WinningPoints ,coalesce(WinOverride ,1) ,0)
                                     )
          ,WeekType        = if_else(matchupPeriodId >= PlayoffStartWeek ,"Playoffs" ,"Regular")
          ,OpposingPoints  = if_else(TotalPoints == WinningPoints ,LosingPoints ,WinningPoints)
@@ -72,6 +85,40 @@ LongScoringData <- LongWeeklyScores %>%
          ,MaxRank = max(WeekRank)
          ,ExpWins = WeekRank / MaxRank) %>%
   ungroup()
+
+## There's a cleaner way of doing this
+## Was very tired of the script by this point
+WeekTypeData <- LongScoringDataTemp %>% 
+  left_join(OwnerTeamData %>% select(seasonId ,TeamId ,PlayoffAppearance) ,by = c("seasonId" ,"TeamId")) %>% 
+  left_join(SettingsData %>% select(seasonId ,settings.scheduleSettings.matchupPeriodCount) ,by = "seasonId") %>% 
+  select(seasonId ,TeamId ,firstName ,matchupPeriodId ,ScheduleId ,WeekType ,Win ,PlayoffAppearance ,settings.scheduleSettings.matchupPeriodCount) %>% 
+  arrange(TeamId ,seasonId ,matchupPeriodId) %>% 
+  mutate(PriorWeekResult = lag(Win)
+         ,WeekType2 = if_else(WeekType == "Regular" 
+                              ,WeekType 
+                              ,if_else(PlayoffAppearance == 0
+                                       ,"Consolation"
+                                       ,if_else(PriorWeekResult == 0 & settings.scheduleSettings.matchupPeriodCount != matchupPeriodId - 1 
+                                                ,"Consolation"
+                                                ,"Playoffs"
+                                                )
+                                       )
+                              )
+         ,PriorWeekType2 = lag(WeekType2)
+         ,WeekType3      = if_else(WeekType2 == "Regular"
+                                   ,WeekType2
+                                   ,if_else(PriorWeekType2 == "Consolation"
+                                            ,"Consolation"
+                                            ,WeekType2
+                                            )
+                                   )
+         ) %>% 
+  select(seasonId ,matchupPeriodId ,ScheduleId ,TeamId ,WeekType3) %>% 
+  rename(WeekType = WeekType3)
+
+LongScoringData <- LongScoringDataTemp %>% 
+  select(-WeekType) %>% 
+  left_join(WeekTypeData ,by = c("seasonId" ,"matchupPeriodId" ,"ScheduleId" ,"TeamId"))
 
 PlayerNames <- LongScoringData %>%
   select(firstName) %>%
@@ -115,34 +162,148 @@ OpponentData <- AllMatchupOptions %>%
   select(seasonId ,matchupPeriodId ,WeekType ,ScheduleId ,Owner ,Opponent ,TotalPoints ,OpposingPoints ,Win) %>% 
   mutate(PointMargin = TotalPoints - OpposingPoints)
 
-LongScoringData %>% 
-  left_join(OwnerTeamData %>% select(seasonId ,TeamId ,PlayoffAppearance) ,by = c("seasonId" ,"TeamId")) %>% 
-  select(seasonId ,TeamId ,firstName ,matchupPeriodId ,ScheduleId ,WeekType ,Win ,PlayoffAppearance) %>% 
-  arrange(TeamId ,seasonId ,matchupPeriodId) %>% 
-  mutate(PriorWeekResult = lag(Win)
-         ,WeekType2 = if_else(WeekType == "Regular" 
-                              ,WeekType 
-                              ,if_else(PlayoffAppearance == 0
-                                       ,"Consolation"
-                                       ,if_else(PriorWeekResult == 0
-                                                ,"Consolation"
-                                                ,"Playoffs"
-                                                )
-                                       )
+Champion <- OwnerTeamData %>% 
+  filter(Championship == 1) %>% 
+  mutate(Champion = str_c(FullName ," (" ,TeamName ,")")) %>% 
+  select(seasonId ,Champion)
+
+BestTeam <- LongScoringData %>%
+  filter(WeekType == "Regular") %>% 
+  group_by(seasonId ,firstName) %>% 
+  summarise(ExpWins        = sum(ExpWins)
+            ,Count         = n()
+            ,ExpWinPercent = ExpWins / Count) %>% 
+  ungroup() %>% 
+  group_by(seasonId) %>% 
+  mutate(MaxExpWins        = max(ExpWins)
+         ,MaxExpWinPercent = max(ExpWinPercent)) %>% 
+  ungroup() %>% 
+  filter(ExpWins == MaxExpWins) %>% 
+  mutate(BestTeam = str_c(firstName 
+                          ," - " 
+                          ,round(ExpWins ,digits = 1) 
+                          ," expected wins ("
+                          ,round(ExpWinPercent * 100 ,digits = 1)
+                          ,"%)"
+                          )
+         ) %>% 
+  select(seasonId ,BestTeam)
+
+TopScorer <- LongScoringData %>%
+  filter(WeekType == "Regular") %>% 
+  group_by(seasonId ,firstName) %>% 
+  summarise(TotalPoints = sum(TotalPoints)
+            ,TotalGames = n()
+            ,AvgPoints  = TotalPoints / TotalGames) %>% 
+  ungroup() %>% 
+  group_by(seasonId) %>% 
+  mutate(MaxTotalPoints = max(TotalPoints)) %>% 
+  ungroup() %>% 
+  filter(TotalPoints == MaxTotalPoints) %>% 
+  mutate(TopScorer = str_c(firstName 
+                           ," - " 
+                           ,format(round(TotalPoints ,digits = 0) ,big.mark = ",")
+                           ," total points ("
+                           ,round(AvgPoints ,digits = 1)
+                           ," avg)"
+                           )
+         ) %>% 
+  select(seasonId ,TopScorer)
+
+WorstTeam <- LongScoringData %>%
+  filter(WeekType == "Regular") %>% 
+  group_by(seasonId ,firstName) %>% 
+  summarise(ExpWins        = sum(ExpWins)
+            ,Count         = n()
+            ,ExpWinPercent = ExpWins / Count) %>% 
+  ungroup() %>% 
+  group_by(seasonId) %>% 
+  mutate(MinExpWins        = min(ExpWins)
+         ,MinExpWinPercent = min(ExpWinPercent)) %>% 
+  ungroup() %>% 
+  filter(ExpWins == MinExpWins) %>% 
+  mutate(WorstTeam = str_c(firstName 
+                           ," - " 
+                           ,round(ExpWins ,digits = 1) 
+                           ," expected wins ("
+                           ,round(ExpWinPercent * 100 ,digits = 1)
+                           ,"%)"
+                           )
+         ) %>% 
+  select(seasonId ,WorstTeam)
+
+LowestScorer <- LongScoringData %>%
+  filter(WeekType == "Regular") %>% 
+  group_by(seasonId ,firstName) %>% 
+  summarise(TotalPoints = sum(TotalPoints)
+            ,TotalGames = n()
+            ,AvgPoints  = TotalPoints / TotalGames) %>% 
+  ungroup() %>% 
+  group_by(seasonId) %>% 
+  mutate(MinTotalPoints = min(TotalPoints)) %>% 
+  ungroup() %>% 
+  filter(TotalPoints == MinTotalPoints) %>% 
+  mutate(LowestScorer = str_c(firstName 
+                              ," - " 
+                              ,format(round(TotalPoints ,digits = 0) ,big.mark = ",")
+                              ," total points ("
+                              ,round(AvgPoints ,digits = 1)
+                              ," avg)"
                               )
          ) %>% 
-  filter(WeekType2 == "Playoffs") %>% 
-  arrange(seasonId ,matchupPeriodId ,ScheduleId) %>% View()
-  
-LongScoringData %>% 
-  left_join(OwnerTeamData %>% select(seasonId ,TeamId ,PlayoffAppearance) ,by = c("seasonId" ,"TeamId")) %>%
+  select(seasonId ,LowestScorer)
+
+## There was a tie for the luckiest team back in 2018
+## Should probably incorporate this logic into the other table columns at some point
+LuckiestTeam <- LongScoringData %>%
+  filter(WeekType == "Regular") %>% 
+  group_by(seasonId ,firstName) %>% 
+  summarise(ExpWins             = sum(ExpWins)
+            ,ActualWins         = sum(Win)
+            ,ActualMinusExpWins = ActualWins - ExpWins
+            ) %>% 
+  ungroup() %>% 
+  group_by(seasonId) %>% 
+  mutate(MaxActualMinusExpWins = max(ActualMinusExpWins)) %>% 
+  ungroup() %>% 
+  filter(ActualMinusExpWins == MaxActualMinusExpWins) %>%
+  group_by(ActualMinusExpWins ,seasonId) %>% 
+  summarise(firstName = str_c(firstName ,collapse = " & ")) %>% 
+  mutate(LuckiestTeam = str_c(firstName 
+                              ," - " 
+                              ,round(ActualMinusExpWins ,digits = 1) 
+                              ," wins above expected"
+                              )
+         ) %>% 
+  ungroup() %>% 
+  select(seasonId ,LuckiestTeam)
+
+UnluckiestTeam <- LongScoringData %>%
+  filter(WeekType == "Regular") %>% 
+  group_by(seasonId ,firstName) %>% 
+  summarise(ExpWins             = sum(ExpWins)
+            ,ActualWins         = sum(Win)
+            ,ActualMinusExpWins = ActualWins - ExpWins
+            ) %>% 
+  ungroup() %>% 
+  group_by(seasonId) %>% 
+  mutate(MinActualMinusExpWins = min(ActualMinusExpWins)) %>% 
+  ungroup() %>% 
+  filter(ActualMinusExpWins == MinActualMinusExpWins) %>% 
+  mutate(UnluckiestTeam = str_c(firstName 
+                                ,": " 
+                                ,round(ActualMinusExpWins ,digits = 1) 
+                                ," wins below expected"
+                                )
+         ) %>% 
+  select(seasonId ,UnluckiestTeam)
 
 ```
 
 Leaderboard
 =======================================================================
 
-Column {data-width=200 .sidebar}
+Sidebar {data-width=200 .sidebar}
 -----------------------------------------------------------------------
 
 ### Filters
@@ -198,7 +359,8 @@ LongScoringData %>%
 ### Regular Season Wins
 
 ```{r}
-TotalWinsData <- reactive({
+
+renderPlot({
   LongScoringData %>%  
     filter(WeekType == "Regular" & seasonId %in% input$YearInput) %>%
     group_by(firstName) %>% 
@@ -216,12 +378,7 @@ TotalWinsData <- reactive({
     select(-Weeks ,-contains("Percent")) %>% 
     ungroup() %>% 
     pivot_longer(names_to = "WinType" ,values_to = "Wins" ,-firstName) %>% 
-    mutate(WinType = if_else(str_detect(WinType ,pattern = "Actual") ,"Actual" ,"Expected"))
-})
-
-
-renderPlot({
-  TotalWinsData() %>%
+    mutate(WinType = if_else(str_detect(WinType ,pattern = "Actual") ,"Actual" ,"Expected")) %>% 
     filter(WinType == "Actual") %>%
     arrange(desc(Wins)) %>%
     mutate(firstName2 = reorder(firstName ,Wins)) %>%
@@ -320,7 +477,7 @@ renderPlot({
 Statistics
 =======================================================================
 
-Column {data-width=200 .sidebar}
+Sidebar {data-width=200 .sidebar}
 -----------------------------------------------------------------------
 
 ### Filters
@@ -347,7 +504,7 @@ Column {data-width=450}
 ### Regular Season Expected Wins
 
 ```{r}
-TotalWinsData <- reactive({
+ExpWinsData <- reactive({
   LongScoringData %>%  
     filter(WeekType == "Regular" & seasonId %in% input$YearInput2) %>%
     group_by(firstName) %>% 
@@ -370,7 +527,7 @@ TotalWinsData <- reactive({
 
 
 renderPlot({
-  TotalWinsData() %>%
+  ExpWinsData() %>%
     filter(WinType == "Expected") %>%
     arrange(desc(Wins)) %>%
     mutate(firstName2 = reorder(firstName ,Wins)) %>%
@@ -491,7 +648,7 @@ renderPlot({
 Owner Performance
 =======================================================================
 
-Column {data-width=200 .sidebar}
+Sidebar {data-width=200 .sidebar}
 -----------------------------------------------------------------------
 
 ### Filters
@@ -508,7 +665,7 @@ selectInput("PlayerInput"
 selectInput("MatchupType"
             ,"Matchup Period:"
             ,choices = WeekTypes
-            ,selected = WeekTypes
+            ,selected = c("Regular" ,"Playoffs")
             ,multiple = TRUE)
 
 # selectInput("YearInput3"
@@ -560,25 +717,16 @@ renderValueBox(
 
 ```{r}
 
-MaxPointMargin <- OpponentData %>% 
-  group_by(Owner ,Opponent) %>% 
-  summarise(PointMargin = sum(PointMargin)) %>% 
-  ungroup() %>% 
-  summarise(MaxMargin = max(PointMargin))
+ReactiveMaxMargin <- reactive({
+  OpponentData %>%
+    filter(WeekType %in% input$MatchupType) %>%
+    group_by(Owner ,Opponent) %>% 
+    summarise(PointMargin = sum(PointMargin)) %>% 
+    ungroup() %>% 
+    summarise(MaxMargin = max(PointMargin)) %>% 
+    pull()
+})
 
-MaxPlayoffPointMargin <- OpponentData %>%
-  filter(WeekType == "Playoffs") %>% 
-  group_by(Owner ,Opponent) %>% 
-  summarise(PointMargin = sum(PointMargin)) %>% 
-  ungroup() %>% 
-  summarise(MaxMargin = max(PointMargin))
-
-MaxRegularPointMargin <- OpponentData %>%
-  filter(WeekType == "Regular") %>% 
-  group_by(Owner ,Opponent) %>% 
-  summarise(PointMargin = sum(PointMargin)) %>% 
-  ungroup() %>% 
-  summarise(MaxMargin = max(PointMargin))
 
 renderPlot({
   OpponentData %>% 
@@ -592,42 +740,16 @@ renderPlot({
       coord_flip() +
       scale_y_continuous(labels = comma_format(accuracy = 1) 
                          ,breaks = pretty_breaks()
-                         # ,limits = c(if_else(length(input$MatchupType) == 2
-                         #                     ,-MaxPointMargin
-                         #                     ,if_else(input$MatchupType == "Regular"
-                         #                              ,-MaxRegularPointMargin
-                         #                              ,-MaxPlayoffPointMargin
-                         #                              )
-                         #                     )
-                         #             ,if_else(length(input$MatchupType) == 2
-                         #                     ,MaxPointMargin
-                         #                     ,if_else(input$MatchupType == "Regular"
-                         #                              ,MaxRegularPointMargin
-                         #                              ,MaxPlayoffPointMargin
-                         #                              )
-                         #                     )
-                         #             )
+                         ,limits = c(-ReactiveMaxMargin() ,ReactiveMaxMargin())
                          ) +
       scale_fill_gradientn(colors = c("darkred", "tomato1","palegreen", "darkgreen")
-                           # ,limit = c(if_else(length(input$MatchupType) == 2
-                           #                   ,-MaxPointMargin
-                           #                   ,if_else(input$MatchupType == "Regular"
-                           #                            ,-MaxRegularPointMargin
-                           #                            ,-MaxPlayoffPointMargin
-                           #                            )
-                           #                   )
-                           #           ,if_else(length(input$MatchupType) == 2
-                           #                   ,MaxPointMargin
-                           #                   ,if_else(input$MatchupType == "Regular"
-                           #                            ,MaxRegularPointMargin
-                           #                            ,MaxPlayoffPointMargin
-                           #                            )
-                           #                   )
-                           #           )
+                           ,limit = c(-ReactiveMaxMargin() ,ReactiveMaxMargin())
                            ) +
       guides(fill ="none") +
       theme_fivethirtyeight()
 })
+
+
 
 ```
 
@@ -641,7 +763,7 @@ renderPlot({
     filter(Owner == input$PlayerInput & WeekType %in% input$MatchupType) %>% 
     group_by(Opponent) %>% 
     summarise(GamesPlayed = n()
-              ,TotalWins  = sum(PointMargin)
+              ,TotalWins  = sum(Win)
               ,WinPercent = TotalWins / GamesPlayed) %>% 
     ungroup() %>% 
     # ggplot(aes(x = reorder(Opponent ,GamesPlayed) ,y = GamesPlayed ,fill = GamesPlayed)) +
@@ -690,32 +812,86 @@ renderGauge({
 
 ```{r}
 
+renderPlot({
+  OpponentData %>% 
+    filter(Owner == input$PlayerInput & WeekType %in% input$MatchupType) %>% 
+    group_by(Opponent) %>% 
+    summarise(GamesPlayed = n()
+              ,TotalWins  = sum(Win)
+              ,WinPercent = TotalWins / GamesPlayed) %>% 
+    ungroup() %>% 
+    ggplot(aes(x = reorder(Opponent ,WinPercent) ,y = WinPercent ,fill = WinPercent)) +
+    # ggplot(aes(x = reorder(Opponent ,WinPercent) ,y = WinPercent)) +
+      geom_col() +
+      geom_hline(yintercept = ReactiveWinPercent() / 100) +  
+      coord_flip() +
+      scale_y_continuous(labels = percent ,limits = c(0 ,1) ,breaks = pretty_breaks()) +
+      scale_fill_gradientn(colors = c("darkred", "tomato1","palegreen", "darkgreen")) +
+      guides(fill ="none") +
+      theme_fivethirtyeight()
+})
+
+
 ```
+
+
+### Score Distribution
+
+```{r}
+
+renderPlot({
+  LongScoringData %>% 
+  filter(firstName == input$PlayerInput & WeekType %in% input$MatchupType) %>% 
+  # filter(firstName == "RoBert" & WeekType %in% c("Regular" ,"Playoffs")) %>% 
+  ggplot(aes(x = seasonId ,y = TotalPoints)) +
+    geom_violin(aes(group = seasonId) ,draw_quantiles = c(0.5)) +
+    geom_jitter(height = 0, width = 0.05) +
+    geom_smooth(se = FALSE) +
+    scale_y_continuous(labels = comma_format(accuracy = 1) ,breaks = pretty_breaks()) +
+    theme_fivethirtyeight()
+})
+
+# LongScoringData %>%
+#   # filter(firstName == input$PlayerInput & WeekType %in% input$MatchupType) %>%
+#   filter(firstName == "RoBert" & WeekType %in% c("Regular" ,"Playoffs")) %>%
+#   ggplot(aes(x = seasonId ,y = TotalPoints)) +
+#     geom_violin(aes(group = seasonId) ,draw_quantiles = c(0.5)) +
+#     geom_jitter(height = 0, width = 0.05) +
+#     geom_smooth(se = FALSE) +
+#     scale_y_continuous(labels = comma_format(accuracy = 1) ,breaks = pretty_breaks()) +
+#     theme_fivethirtyeight()
+    
+
+```
+
 
 
 Season Recaps
 =======================================================================
 
-Column {data-width=200 .sidebar}
+Column {data-width=1000}
 -----------------------------------------------------------------------
 
-### Filters
+### Seasons in Review
 
 ```{r}
 
-selectInput("YearInput4"
-            ,"Select year(s):"
-            ,choices = SeasonYears
-            ,selected = SeasonYears
-            ,multiple = TRUE)
+SeasonRecap <- Champion %>% 
+  left_join(BestTeam ,by = "seasonId") %>% 
+  left_join(TopScorer ,by = "seasonId") %>% 
+  left_join(LuckiestTeam ,by = "seasonId") %>%
+  left_join(WorstTeam ,by = "seasonId") %>% 
+  left_join(LowestScorer ,by = "seasonId") %>% 
+  left_join(UnluckiestTeam ,by = "seasonId") %>% 
+  rename(Season = seasonId) %>% 
+  arrange(Season)
+
+colnames(SeasonRecap) <- str_replace(colnames(SeasonRecap) ,pattern = "([[:lower:]])([[:upper:]])" ,replacement = "\\1 \\2")
+
+
+datatable(SeasonRecap)
 
 ```
-
-
-Column {data-width=450}
------------------------------------------------------------------------
-
-
 
 
 
